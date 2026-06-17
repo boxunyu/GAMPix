@@ -110,6 +110,9 @@ class Config:
     make_plots: bool
 
     fit_waveforms: bool
+    plot_fit_examples: bool
+    fit_example_clusters: int
+    fit_example_hits_per_cluster: int
 
     @property
     def threshold(self) -> float:
@@ -190,7 +193,15 @@ def parse_args() -> Config:
                     help="Number of truth segment rows to read at a time. Smaller uses less memory.")
     ap.add_argument("--make-plots", action="store_true", help="Write basic diagnostic plots")
     ap.add_argument("--fit-waveforms", action="store_true",
-                    help="Also fit summed pixel/tile cluster waveforms with a Gaussian")
+                    help=("Fit individual pixel waveforms and summed cluster waveforms with a Gaussian. "
+                          "This enables Gaussian-fit charge columns, including pixel_fit_charge_3sd."))
+    ap.add_argument("--plot-fit-examples", action="store_true",
+                    help=("When --fit-waveforms is enabled, save example individual-pixel Gaussian-fit plots "
+                          "for the first few clusters."))
+    ap.add_argument("--fit-example-clusters", type=int, default=2,
+                    help="Number of earliest clusters for which to save example fit plots")
+    ap.add_argument("--fit-example-hits-per-cluster", type=int, default=10,
+                    help="Maximum number of individual pixel-hit fit plots to save per example cluster")
 
     a = ap.parse_args()
     return Config(**vars(a))
@@ -296,12 +307,63 @@ def gaussian_no_offset(t, amp, mu, sigma):
     return amp * np.exp(-0.5 * ((t - mu) / sigma) ** 2)
 
 
+def gaussian_charge_total(amp: float, sigma: float, tick_size: float) -> float:
+    """Integral of A exp(-0.5*((t-mu)/sigma)^2), divided by tick size."""
+    if not (np.isfinite(amp) and np.isfinite(sigma)) or amp <= 0 or sigma <= 0:
+        return np.nan
+    return float(amp * abs(sigma) * math.sqrt(2.0 * math.pi) / tick_size)
+
+
+def gaussian_charge_above_threshold(
+    amp: float,
+    sigma: float,
+    threshold: float,
+    tick_size: float,
+    subtract_threshold: bool = False,
+) -> float:
+    """
+    Gaussian charge in the region where the fitted signal is above threshold.
+
+    If subtract_threshold=False, this is
+        integral Gaussian(t) dt over Gaussian(t) > threshold
+    divided by tick size.  This matches the raw thresholded waveform convention
+    used in pixel_charge_3sd: sum waveform bins whose value is above threshold.
+
+    If subtract_threshold=True, this is
+        integral max(Gaussian(t) - threshold, 0) dt
+    divided by tick size.
+    """
+    if not (np.isfinite(amp) and np.isfinite(sigma) and np.isfinite(threshold)):
+        return np.nan
+    amp = float(amp)
+    sigma = abs(float(sigma))
+    threshold = float(threshold)
+    if amp <= 0 or sigma <= 0:
+        return np.nan
+    if threshold <= 0:
+        return gaussian_charge_total(amp, sigma, tick_size)
+    if amp <= threshold:
+        return 0.0
+
+    half_width = sigma * math.sqrt(2.0 * math.log(amp / threshold))
+    area_inside = (
+        amp * sigma * math.sqrt(2.0 * math.pi)
+        * math.erf(half_width / (math.sqrt(2.0) * sigma))
+    )
+    if subtract_threshold:
+        area_inside -= 2.0 * half_width * threshold
+        area_inside = max(area_inside, 0.0)
+    return float(area_inside / tick_size)
+
+
 def fit_summed_waveform(wf_sum: np.ndarray, cfg: Config) -> Dict[str, float]:
     out = {
         "fit_amp": np.nan,
         "fit_mu": np.nan,
         "fit_sigma": np.nan,
         "fit_charge": np.nan,
+        "fit_charge_3sd": np.nan,
+        "fit_charge_above_threshold_subtracted": np.nan,
         "fit_rmse": np.nan,
         "fit_success": False,
     }
@@ -326,18 +388,148 @@ def fit_summed_waveform(wf_sum: np.ndarray, cfg: Config) -> Dict[str, float]:
         )
         amp, mu, sigma = [float(v) for v in popt]
         yhat = gaussian_no_offset(t, amp, mu, sigma)
-        charge = amp * abs(sigma) * math.sqrt(2.0 * math.pi) / cfg.tick_size
+        sigma_abs = abs(sigma)
+        charge = gaussian_charge_total(amp, sigma_abs, cfg.tick_size)
+        charge_3sd = gaussian_charge_above_threshold(
+            amp, sigma_abs, cfg.threshold, cfg.tick_size, subtract_threshold=False
+        )
+        charge_sub = gaussian_charge_above_threshold(
+            amp, sigma_abs, cfg.threshold, cfg.tick_size, subtract_threshold=True
+        )
         out.update({
             "fit_amp": amp,
             "fit_mu": mu,
-            "fit_sigma": abs(sigma),
+            "fit_sigma": sigma_abs,
             "fit_charge": float(charge),
+            "fit_charge_3sd": float(charge_3sd),
+            "fit_charge_above_threshold_subtracted": float(charge_sub),
             "fit_rmse": float(np.sqrt(np.mean((y - yhat) ** 2))),
             "fit_success": True,
         })
     except Exception:
         pass
     return out
+
+
+def fit_pixel_waveforms_individually(waveforms: np.ndarray, cfg: Config) -> Dict[str, object]:
+    """
+    Fit each selected pixel-hit waveform individually and sum the fitted charges.
+
+    The main new charge for this request is pixel_fit_charge_3sd:
+      sum over pixel hits of the fitted Gaussian integral in the region where
+      Gaussian(t) > 3*sigma_noise.
+
+    This can be slower than simple waveform sums, so it is only run when
+    --fit-waveforms is enabled.
+    """
+    wf = np.asarray(waveforms, dtype=float)
+    if wf.size == 0:
+        return {
+            "individual_fit_charge": np.nan,
+            "individual_fit_charge_3sd": np.nan,
+            "individual_fit_charge_above_threshold_subtracted": np.nan,
+            "individual_fit_success_count": 0,
+            "individual_fit_fail_count": 0,
+            "individual_fit_results": [],
+        }
+    if wf.ndim == 1:
+        wf = wf[None, :]
+
+    results: List[Dict[str, float]] = []
+    total_charge = 0.0
+    total_charge_3sd = 0.0
+    total_charge_sub = 0.0
+    success = 0
+
+    for row in wf:
+        fit = fit_summed_waveform(row, cfg)
+        results.append(fit)
+        if fit.get("fit_success", False):
+            success += 1
+            if np.isfinite(fit.get("fit_charge", np.nan)):
+                total_charge += float(fit["fit_charge"])
+            if np.isfinite(fit.get("fit_charge_3sd", np.nan)):
+                total_charge_3sd += float(fit["fit_charge_3sd"])
+            if np.isfinite(fit.get("fit_charge_above_threshold_subtracted", np.nan)):
+                total_charge_sub += float(fit["fit_charge_above_threshold_subtracted"])
+
+    return {
+        "individual_fit_charge": float(total_charge) if success > 0 else np.nan,
+        "individual_fit_charge_3sd": float(total_charge_3sd) if success > 0 else np.nan,
+        "individual_fit_charge_above_threshold_subtracted": float(total_charge_sub) if success > 0 else np.nan,
+        "individual_fit_success_count": int(success),
+        "individual_fit_fail_count": int(len(wf) - success),
+        "individual_fit_results": results,
+    }
+
+
+def save_pixel_fit_example_plots(
+    cluster_id: int,
+    event_id: int,
+    pixel_waveforms: np.ndarray,
+    individual_fit_results: List[Dict[str, float]],
+    cfg: Config,
+) -> None:
+    """
+    Save a small number of individual pixel-waveform Gaussian-fit plots.
+
+    This intentionally only saves examples for the earliest clusters, because
+    plotting every pixel hit would produce too many files.
+    """
+    if plt is None or not cfg.plot_fit_examples or not cfg.fit_waveforms:
+        return
+    if cluster_id >= cfg.fit_example_clusters:
+        return
+
+    wf = np.asarray(pixel_waveforms, dtype=float)
+    if wf.ndim == 1:
+        wf = wf[None, :]
+
+    n_plot = min(len(wf), cfg.fit_example_hits_per_cluster)
+    if n_plot <= 0:
+        return
+
+    plot_dir = os.path.join(cfg.output_dir, "plots", "gaussian_fit_examples")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    t = (np.arange(wf.shape[1], dtype=float) - cfg.pre_samples) * cfg.tick_size
+
+    for i in range(n_plot):
+        y = wf[i]
+        fit = individual_fit_results[i] if i < len(individual_fit_results) else {}
+
+        plt.figure(figsize=(8, 5))
+        plt.plot(t, y, marker="o", linestyle="-", label="pixel waveform")
+        plt.axhline(cfg.threshold, linestyle="--", linewidth=1.2, label=f"3sigma threshold = {cfg.threshold:g}")
+
+        if fit.get("fit_success", False):
+            amp = float(fit["fit_amp"])
+            mu = float(fit["fit_mu"])
+            sigma = float(fit["fit_sigma"])
+            tt = np.linspace(float(np.min(t)), float(np.max(t)), 300)
+            yy = gaussian_no_offset(tt, amp, mu, sigma)
+            plt.plot(tt, yy, linewidth=1.5, label="Gaussian fit")
+            title = (
+                f"cluster {cluster_id}, event {event_id}, pixel hit {i}\\n"
+                f"Q_fit={fit.get('fit_charge', np.nan):.3g}, "
+                f"Q_fit_3sd={fit.get('fit_charge_3sd', np.nan):.3g}, "
+                f"sigma={sigma:.3g}"
+            )
+        else:
+            title = f"cluster {cluster_id}, event {event_id}, pixel hit {i}\\nGaussian fit failed"
+
+        plt.xlabel("time")
+        plt.ylabel("charge")
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
+
+        out = os.path.join(
+            plot_dir,
+            f"cluster_{cluster_id:04d}_event_{event_id}_pixelhit_{i:02d}_gaussfit.png",
+        )
+        plt.savefig(out, dpi=160)
+        plt.close()
 
 
 # -----------------------------------------------------------------------------
@@ -886,6 +1078,17 @@ def build_cluster_row(
 
     pixel_fit = fit_summed_waveform(pixel_wf_sum, cfg) if cfg.fit_waveforms else {}
     tile_fit = fit_summed_waveform(tile_wf_sum, cfg) if cfg.fit_waveforms and len(tsel) else {}
+    pixel_individual_fit = (
+        fit_pixel_waveforms_individually(pwf[psel], cfg) if cfg.fit_waveforms else {}
+    )
+    if cfg.fit_waveforms and cfg.plot_fit_examples:
+        save_pixel_fit_example_plots(
+            cluster_id=cluster_id,
+            event_id=event_id,
+            pixel_waveforms=pwf[psel],
+            individual_fit_results=pixel_individual_fit.get("individual_fit_results", []),
+            cfg=cfg,
+        )
 
     seg_w = segment_weights_from_hits(plabel, pattr, pwf, psel)
     ts = truth_summary(event_id, seg_w, truth, cfg)
@@ -946,9 +1149,38 @@ def build_cluster_row(
         for prefix, d in [("pixel", pixel_fit), ("tile", tile_fit)]:
             for key, val in d.items():
                 row[f"{prefix}_{key}"] = val
+
+        row["pixel_individual_fit_charge"] = pixel_individual_fit.get("individual_fit_charge", np.nan)
+        row["pixel_individual_fit_charge_3sd"] = pixel_individual_fit.get("individual_fit_charge_3sd", np.nan)
+        row["pixel_individual_fit_charge_above_threshold_subtracted"] = pixel_individual_fit.get(
+            "individual_fit_charge_above_threshold_subtracted", np.nan
+        )
+        row["pixel_individual_fit_success_count"] = pixel_individual_fit.get("individual_fit_success_count", 0)
+        row["pixel_individual_fit_fail_count"] = pixel_individual_fit.get("individual_fit_fail_count", 0)
+
+        # Ratios using the Gaussian-fitted pixel charge above 3sigma.
+        # The raw-tile version is the closest analog of R_3sd_pixel_over_tile_rawtile,
+        # but with pixel charge taken from fitted Gaussian waveforms.
         pf = row.get("pixel_fit_charge", np.nan)
         tf = row.get("tile_fit_charge", np.nan)
         row["R_fit_pixel_over_tile"] = pf / tf if np.isfinite(pf) and np.isfinite(tf) and tf > 0 else np.nan
+
+        pif3 = row.get("pixel_individual_fit_charge_3sd", np.nan)
+        row["R_pixel_individual_fit3sd_over_rawtile"] = (
+            pif3 / tile_charge if np.isfinite(pif3) and tile_charge > 0 else np.nan
+        )
+        row["R_pixel_individual_fit3sd_over_3sdtile"] = (
+            pif3 / tile_charge_3sd if np.isfinite(pif3) and tile_charge_3sd > 0 else np.nan
+        )
+
+        # Also provide the summed-cluster-waveform fit above threshold for comparison.
+        psf3 = row.get("pixel_fit_charge_3sd", np.nan)
+        row["R_pixel_summed_fit3sd_over_rawtile"] = (
+            psf3 / tile_charge if np.isfinite(psf3) and tile_charge > 0 else np.nan
+        )
+        row["R_pixel_summed_fit3sd_over_3sdtile"] = (
+            psf3 / tile_charge_3sd if np.isfinite(psf3) and tile_charge_3sd > 0 else np.nan
+        )
 
     return row
 
@@ -1039,6 +1271,10 @@ def write_outputs(df: pd.DataFrame, cfg: Config) -> None:
         "cut_R_0_1": df["R_pixel_over_tile"].between(0, 1, inclusive="right") if "R_pixel_over_tile" in df else pd.Series(False, index=df.index),
         "cut_R3sd_rawtile_0_1": df["R_3sd_pixel_over_tile_rawtile"].between(0, 1, inclusive="right") if "R_3sd_pixel_over_tile_rawtile" in df else pd.Series(False, index=df.index),
         "matched_tiles_only": (df["n_tile_hits"] > 0) if "n_tile_hits" in df else pd.Series(False, index=df.index),
+        "cut_Rfit3sd_rawtile_0_1": (
+            df["R_pixel_individual_fit3sd_over_rawtile"].between(0, 1, inclusive="right")
+            if "R_pixel_individual_fit3sd_over_rawtile" in df else pd.Series(False, index=df.index)
+        ),
     }
     for name, mask in cut_specs.items():
         path = os.path.join(cfg.output_dir, f"{cfg.tag}_{name}.csv")
@@ -1079,8 +1315,13 @@ def make_plots(df: pd.DataFrame, cfg: Config) -> None:
         plt.savefig(os.path.join(plot_dir, f"hist_{col}.png"), dpi=160)
         plt.close()
 
+    save_hist("n_tile_hits", bins=range(0, int(pd.to_numeric(df["n_tile_hits"], errors="coerce").max()) + 2) if "n_tile_hits" in df and len(df) else 50)
     save_hist("R_pixel_over_tile", rng=(0, 2))
     save_hist("R_3sd_pixel_over_tile_rawtile", rng=(0, 2))
+    save_hist("R_pixel_individual_fit3sd_over_rawtile", rng=(0, 2))
+    save_hist("R_pixel_individual_fit3sd_over_3sdtile", rng=(0, 2))
+    save_hist("pixel_individual_fit_success_count")
+    save_hist("pixel_individual_fit_fail_count")
     save_hist("drift_length_attr_avg")
     save_hist("drift_325_minus_x_attr_avg")
     save_hist("drift_geometry_signed_attr_avg")
@@ -1096,6 +1337,19 @@ def make_plots(df: pd.DataFrame, cfg: Config) -> None:
             plt.ylabel("R_pixel_over_tile")
             plt.tight_layout()
             plt.savefig(os.path.join(plot_dir, "R_vs_drift_length_attr_avg.png"), dpi=160)
+            plt.close()
+
+    if "drift_length_attr_avg" in df and "R_pixel_individual_fit3sd_over_rawtile" in df:
+        x = pd.to_numeric(df["drift_length_attr_avg"], errors="coerce")
+        y = pd.to_numeric(df["R_pixel_individual_fit3sd_over_rawtile"], errors="coerce")
+        good = np.isfinite(x) & np.isfinite(y)
+        if good.sum() > 0:
+            plt.figure()
+            plt.scatter(x[good], y[good], s=4, alpha=0.4)
+            plt.xlabel("drift_length_attr_avg")
+            plt.ylabel("R_pixel_individual_fit3sd_over_rawtile")
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, "R_fit3sd_rawtile_vs_drift_length_attr_avg.png"), dpi=160)
             plt.close()
 
 
@@ -1116,6 +1370,13 @@ def main() -> None:
     print(f"Drift mode: {cfg.drift_mode}")
     print(f"Truth lookup: {cfg.truth_lookup}")
     print("Truth weights: require attribution > 0 and waveform charge > 0 per tick")
+    if cfg.fit_waveforms:
+        print("Gaussian fits: enabled")
+        if cfg.plot_fit_examples:
+            print(
+                f"Gaussian fit examples: first {cfg.fit_example_clusters} clusters, "
+                f"{cfg.fit_example_hits_per_cluster} pixel hits each"
+            )
 
     selected_event_ids, wanted_segment_ids = collect_selected_events_and_segment_ids(cfg)
     print(f"Detector events selected for processing: {len(selected_event_ids)}")
